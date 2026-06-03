@@ -1,0 +1,5 @@
+# build artifacts and caches (see build-rtcfix.sh)
+.build/
+.srccache/
+out/
+*.pkg.tar.zst

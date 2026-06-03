@@ -1,0 +1,88 @@
+From 223860241c57113e177b622216baa805b3501eb9 Mon Sep 17 00:00:00 2001
+From: Adam <adam@example.invalid>
+Date: Wed, 3 Jun 2026 14:10:54 +0000
+Subject: [PATCH] alarmtimer: preserve sub-second offset when arming the
+ suspend RTC alarm
+
+alarmtimer_suspend() programs the wakeup alarm from the current RTC time:
+
+	rtc_read_time(rtc, &tm);
+	now = rtc_tm_to_ktime(tm);
+	...
+	now = ktime_add(now, min);
+	rtc_timer_start(rtc, &rtctimer, now, 0);
+
+rtc_read_time() has one-second resolution, so rtc_tm_to_ktime() floors the
+current time and discards its sub-second fraction.  rtc_timer_start() later
+converts the alarm back with rtc_ktime_to_tm(), which rounds any non-zero
+nanosecond part up to the next whole second.  That round-up compensates for
+the fractional part of @min, but not for the fraction that was already
+dropped from @now.  The programmed alarm is therefore
+
+	alarm = ceil(floor(now) + min)
+
+which is up to one second earlier than the requested expiry whenever
+
+	frac(now) + frac(min) > 1
+
+On an s2idle resume this makes the RTC fire slightly before the in-kernel
+deadline.  A CLOCK_BOOTTIME_ALARM timerfd armed for the same deadline is
+then not yet readable at resume time, so a consumer that classifies the
+wake source with a zero-timeout poll() on that timerfd -- as
+systemd-sleep's suspend-then-hibernate path does -- treats the wake as
+spurious and skips the hibernation step.  The observable result is an
+intermittent, sub-second-phase-dependent "suspend-then-hibernate wakes and
+stays up" failure.
+
+Recover the discarded fraction from the system clock before adding @min, so
+the alarm is derived from the true current time.  Only the sub-second part
+of CLOCK_REALTIME is used, so the result is unaffected by any absolute skew
+between the system clock and the RTC; the existing rtc_ktime_to_tm()
+round-up then guarantees the alarm is never programmed earlier than the
+requested expiry.
+
+Signed-off-by: Your Name <you@example.com>
+---
+ kernel/time/alarmtimer.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/kernel/time/alarmtimer.c b/kernel/time/alarmtimer.c
+index b64db40..ac62a50 100644
+--- a/kernel/time/alarmtimer.c
++++ b/kernel/time/alarmtimer.c
+@@ -13,6 +13,7 @@
+  * Author: John Stultz <john.stultz@linaro.org>
+  */
+ #include <linux/time.h>
++#include <linux/math64.h>
+ #include <linux/hrtimer.h>
+ #include <linux/timerqueue.h>
+ #include <linux/rtc.h>
+@@ -266,6 +267,24 @@ static int alarmtimer_suspend(struct device *dev)
+ 	rtc_read_time(rtc, &tm);
+ 	now = rtc_tm_to_ktime(tm);
+ 
++	/*
++	 * rtc_read_time() has one-second resolution, so rtc_tm_to_ktime()
++	 * floored @now and dropped its sub-second part. The rtc_ktime_to_tm()
++	 * in rtc_timer_start() below rounds the programmed alarm up by a second,
++	 * which compensates for frac(@min) but not for the fraction discarded
++	 * here -- so without this the alarm can be programmed up to one second
++	 * early, and on an s2idle resume the wakeup precedes the in-kernel
++	 * deadline that a CLOCK_BOOTTIME_ALARM timerfd (e.g. systemd-sleep's
++	 * suspend-then-hibernate poll) is waiting on. Add back the sub-second
++	 * part of the system clock -- only the fraction, so any absolute skew
++	 * between the system clock and the RTC is irrelevant.
++	 */
++	{
++		u64 now_ns = ktime_get_real_ns();
++
++		now = ktime_add_ns(now, do_div(now_ns, NSEC_PER_SEC));
++	}
++
+ 	/*
+ 	 * If the RTC alarm timer only supports a limited time offset, set the
+ 	 * alarm time to the maximum supported value.
+-- 
+2.43.0
+
